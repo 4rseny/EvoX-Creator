@@ -1,0 +1,97 @@
+name: Build Evolution X
+
+on:
+  workflow_dispatch:
+    inputs:
+      device_tree:
+        description: "Git URL of the device tree"
+        required: true
+      vendor_tree:
+        description: "Git URL of the vendor tree"
+        required: true
+      evox_version:
+        description: "Evolution X version (e.g., snow, tifa)"
+        required: true
+      device_codename:
+        description: "Device codename (e.g., raphael)"
+        required: true
+      ssh_host:
+        description: "SSH Host of your remote build server"
+        required: true
+      ssh_user:
+        description: "SSH username on remote server"
+        required: true
+      ssh_key:
+        description: "Base64-encoded private SSH key with access to server"
+        required: true
+      remote_build_dir:
+        description: "Absolute path to build directory on your remote server"
+        required: true
+
+jobs:
+  build:
+    name: Build ROM on Remote Disk
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Set up 8GB Swap Space
+      run: |
+        sudo fallocate -l 8G /swapfile
+        sudo chmod 600 /swapfile
+        sudo mkswap /swapfile
+        sudo swapon /swapfile
+        free -h
+
+    - name: Install Required Packages
+      run: |
+        sudo apt update
+        sudo apt install -y sshfs git rsync openjdk-11-jdk
+
+    - name: Decode SSH Private Key
+      run: |
+        echo "${{ github.event.inputs.ssh_key }}" | base64 -d > ~/.ssh/id_rsa
+        chmod 600 ~/.ssh/id_rsa
+
+    - name: Mount Remote Build Directory
+      run: |
+        mkdir -p ~/evox-remote
+        sshfs -o StrictHostKeyChecking=no -o IdentityFile=~/.ssh/id_rsa \
+          ${{ github.event.inputs.ssh_user }}@${{ github.event.inputs.ssh_host }}:${{ github.event.inputs.remote_build_dir }} ~/evox-remote
+
+    - name: Initialize and Sync Source
+      run: |
+        cd ~/evox-remote
+        if [ ! -d ".repo" ]; then
+          repo init -u https://github.com/Evolution-X/manifest -b ${{ github.event.inputs.evox_version }}
+        fi
+        repo sync -j$(nproc) --force-sync --no-clone-bundle --no-tags
+
+        # Clone device & vendor trees
+        git clone ${{ github.event.inputs.device_tree }} device/${{ github.event.inputs.device_codename }}
+        git clone ${{ github.event.inputs.vendor_tree }} vendor/${{ github.event.inputs.device_codename }}
+
+    - name: Build Evolution X
+      run: |
+        cd ~/evox-remote
+        source build/envsetup.sh
+        lunch evolution_${{ github.event.inputs.device_codename }}-userdebug
+        make evolution -j$(nproc)
+
+    - name: Copy ROM ZIP to GitHub Workspace
+      run: |
+        mkdir -p $GITHUB_WORKSPACE/rom
+        cp ~/evox-remote/out/target/product/${{ github.event.inputs.device_codename }}/*.zip $GITHUB_WORKSPACE/rom || echo "No ZIP found"
+
+    - name: Upload ROM Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: evox-rom-${{ github.event.inputs.device_codename }}
+        path: rom/*.zip
+        if-no-files-found: warn
+
+    - name: Unmount Remote Build Directory and Cleanup
+      if: always()
+      run: |
+        sudo swapoff /swapfile
+        rm -f /swapfile ~/.ssh/id_rsa
+        fusermount -u ~/evox-remote
